@@ -1,2 +1,4 @@
 # Cancer-Data-Analysis
-Charlie Lake's public projects!
+Cancer Data Analysis using data from TCGA Dataset on Urothelial Bladder Cancer
+
+
