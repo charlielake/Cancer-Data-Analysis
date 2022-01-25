@@ -1,0 +1,611 @@
+---
+title: "BLCA Analysis"
+author: "Charlie Lake (51659233), Carter Glen (16453292), Alvin Hendricks (58104407)"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load Libraries
+library("ggplot2")
+library("TCGAbiolinks")
+library("SummarizedExperiment")
+library("survival")
+library("survminer")
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library("biomaRt")
+library("pheatmap")
+library(tidyverse)
+library(readxl)
+library(FactoMineR)
+library(factoextra)
+```
+
+# Data Deconstruction
+```{r initial exploration}
+# Read data
+clinical_data <- read.delim("data/data_clinical_patient.txt", header=TRUE, comment.char="#")
+mutation_data <- read.delim("data/data_mutations.txt", header=TRUE)
+rna_seq_data <- read.csv("data/RNAseq.csv")
+```
+
+```{r}
+# Explore the data a bit:
+head(clinical_data)
+head(mutation_data)
+head(rna_seq_data)
+```
+
+How many people of each sex (who have this cancer) do we have in our data?
+```{r}
+ggplot(clinical_data, aes(x=SEX))+ geom_bar()
+```
+
+How about ages?
+```{r}
+ggplot(clinical_data, aes(x=AGE))+ geom_histogram(binwidth=1, colour="black", fill="cyan")
+```
+
+Let us update some values for better processing...
+
+Here, we made sex into a binary value - Male (1), Female (0)
+```{r}
+# Turn SEX field into binary value
+clinical_data$SEX <- ifelse(clinical_data$SEX == 'Male', 1, 0)
+
+# Define function to convert stage of cancer to numeric value
+convert_decimal_stage <- function(string){
+  if(isEmpty(string)){
+    return(0)
+  }
+  
+  split <- unlist(strsplit(string, " "))
+  return(as.numeric(as.roman(split[2])))
+}
+
+# Apply change to numeric
+clinical_data$AJCC_PATHOLOGIC_TUMOR_STAGE <- unlist(lapply(clinical_data$AJCC_PATHOLOGIC_TUMOR_STAGE, convert_decimal_stage))
+length(which(!is.na(clinical_data$AJCC_PATHOLOGIC_TUMOR_STAGE)))
+length(which(is.na(clinical_data$AJCC_PATHOLOGIC_TUMOR_STAGE)))
+
+# Drops samples with incomplete entries (no tumor stage), as we want to explore expression related to tumor stage
+clinical_data <- clinical_data[complete.cases(clinical_data$AJCC_PATHOLOGIC_TUMOR_STAGE),]
+
+head(clinical_data)
+```
+
+Proportion of tumor stages in our data (still exploration):
+```{r}
+ggplot(clinical_data, aes(x=AJCC_PATHOLOGIC_TUMOR_STAGE))+ geom_histogram(binwidth=1, colour="black", fill="orange")
+```
+
+
+
+
+## Matching Patient IDs to RNA-Seq IDs
+Some of the patients are not found in both the clinical and RNA seq dataset. We filter them out here. So, what we have now are:
+Index of patients who are NOT in the TCGA data (n = 4) out of n = 407.
+
+```{r}
+# Function to get patient ID tag
+get_patient_ID <- function(string){
+  split <- unlist(strsplit(string,split="[.-]"))
+  return(split[3])
+}
+
+# store list of sample IDs from RNA Seq Data
+rseq_headers <- colnames(rna_seq_data)
+
+# store list of patient IDs
+rseq_patients <- unlist(lapply(rseq_headers[-1],get_patient_ID))
+clinical_patients <- unlist(lapply(clinical_data$PATIENT_ID, get_patient_ID))
+
+# define function to return names found in both clinical data and RNA seq data
+check_in <- function(string, arr){
+  #return(ifelse(string %in% arr == TRUE, 1,0))
+  return(match(string,arr))                             
+}
+
+# match two datasets
+ids_idx <- unlist(lapply(clinical_patients, check_in, arr=rseq_patients))
+
+# Counts of sample IDs to be filtered out (for not mapping between clinical and RNA data)
+cat('Number of Valid Entries=',length(ids_idx[!is.na(ids_idx)]),'\nNumber of Invalid Entries=',length(ids_idx[is.na(ids_idx)]),'\nIndex of Invalid Entries =',which(is.na(ids_idx)))
+```
+
+## Match RNA_SEQ IDs to Patients IDs
+```{r}
+# Get which ones are not present in both datasets
+invalid_idx <- which(is.na(ids_idx))
+ids_idx <- ids_idx[complete.cases(ids_idx)]
+
+#
+cleaned_rna_seq_data <- rna_seq_data[,-1]
+rownames(cleaned_rna_seq_data) <- rna_seq_data[,1]
+
+# Filter out values that are not present in both datasets
+cleaned_rna_seq_data <- cleaned_rna_seq_data[,ids_idx]
+cleaned_clinical_data <- clinical_data[-invalid_idx,]
+
+# List of rseq and clinical patients
+rseq_patients <- unlist(lapply(colnames(cleaned_rna_seq_data), get_patient_ID))
+clinical_patients <- unlist(lapply(cleaned_clinical_data$PATIENT_ID, get_patient_ID))
+```
+
+```{r}
+# Map ENSEMBL gene IDs
+gene_ids <- mapIds(org.Hs.eg.db,keys=row.names(cleaned_rna_seq_data), column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+```
+
+# Data Visualization - Heatmap of Gene Expression
+```{r}
+# First, let's filter out genes with a low average expression (mean less than 5), as these will likely not significantly contribute to our analysis
+filtered_rna_seq_data <- cleaned_rna_seq_data[rowMeans(cleaned_rna_seq_data) >= 5,]
+```
+
+```{r}
+# take log(TPM + 1) to make it easier to plot as a heatmap, so we can identify expression better
+log_TPM_plusone <- log(filtered_rna_seq_data + 1)
+
+# Transpose to set gene counts as features, samples as rows - for use in PCA
+Tfiltered_rna_seq_data <- as.data.frame(t(filtered_rna_seq_data))
+Tlog_TPM_plusone <- as.data.frame(t(log_TPM_plusone))
+
+# Now, visualize it:
+pheatmap(log_TPM_plusone, kmeans_k = 50, show_colnames = FALSE, show_rownames = FALSE)
+```
+Note that the size of our data is too large to be directly plotted - above we clustered the data on the heatmap into fewer groups of genes so we can visualize general clusters that may exist in the data. This will let us see any groups of genes exist with high expression (so we know them exist ahead of time!), and whether samples have higher expression of these groups of genes. However, we cannot identify specific genes with differential expression due to this.
+
+So, there are clearly groups of genes with high expression. Note that the rows here represent a group of genes (clustered with kmeans; k = 50).
+
+Let's also look at the z-score transformed version, to see if these groups (or any groups) are actually outlier groups (so just another visualization!):
+```{r}
+# Transpose so that we scale rows (i.e., expression of a specific gene)
+TZTPM <- scale(Tlog_TPM_plusone, scale = TRUE, center = TRUE)
+ZTPM <- as.data.frame(t(TZTPM))
+# Transpose back, this will show us our rows as gene expression, columns as samples
+pheatmap(ZTPM, kmeans_k = 50, show_colnames = FALSE, show_rownames = FALSE)
+```
+Again, we can see some groups of genes (rows) with generally high, differential expression (z-score normalizes it so we know they're differentially expressed rather than some genes simply having higher baseline expression). We can also clearly see some samples (columns) with higher expression across many genes.  There's clearly something causing differential expression in these patients.
+
+
+# PCA
+Let's perform PCA:
+Ideally, this will let us identify axes which (due to representing more variance in the data), can fully explain differences in the cancer stage. That is, the clusters will be defined by the presence of mutations in certain genes (which the PCs will be representing) that allow us to find clear groups of expression. Our aim would be to map this back to stage of cancer.
+```{r}
+# Perform PCA, store into a data frame
+pcs <- prcomp(Tlog_TPM_plusone, center = TRUE, scale = FALSE)
+PCdata <- as.data.frame(pcs$x)
+```
+
+Let's plot the values of our different PCs along the axes of different PCs to try to find clusters. Below are a few examples:
+```{r}
+ggplot(PCdata[,1:2], aes(PC1, PC2)) + geom_point()
+ggplot(PCdata[,c(1,3)], aes(PC1, PC3)) + geom_point()
+ggplot(PCdata[,c(1,4)], aes(PC1, PC4)) + geom_point()
+ggplot(PCdata[,c(1,5)], aes(PC1, PC5)) + geom_point()
+```
+We did not find any explicit perfect separation between groups (in these examples and some others that were tried, excluded as they did not present any new information), and therefore there may not be any linearly separable clusters in the data. Given this, let's perform clustering on the values of our first two PCs, given that they explain the most variance in expression, and see if there's any difference in counts. While there may not be perfect separation as we hoped for, we might be able to detect some differences still.
+
+## K-means
+```{r}
+#Run kmeans on first two PCs, and visualize
+kmeans_PC_1and2 <- kmeans(PCdata[,1:2], centers = 4, nstart = 50)
+fviz_cluster(kmeans_PC_1and2,  data = PCdata[,1:2], geom=c('point'))
+```
+
+```{r}
+# Store the cluster centers and labels for our different samples
+kmeans_pc_summary <- data.frame(kmeans_PC_1and2$size, kmeans_PC_1and2$centers)
+PCdata$cluster <- as.character(kmeans_PC_1and2$cluster)
+```
+
+```{r}
+# See summary
+kmeans_pc_summary
+```
+
+```{r}
+# How many values per cluster?
+ggplot(data = PCdata, aes(cluster)) + geom_bar(aes(fill=cluster)) + ggtitle('Count of samples per cluster')
+```
+Note that this already doesn't match with our count of cancer stage above - our clusters likely won't match to the cancer stages.
+
+Perform counts of our clusters to see if these clusters differ in any values.
+```{r}
+# Subset each cluster from the clinical data
+cluster1 <- cleaned_clinical_data[which(PCdata$cluster == 1),]
+cluster2 <- cleaned_clinical_data[which(PCdata$cluster == 2),]
+cluster3 <- cleaned_clinical_data[which(PCdata$cluster == 3),]
+cluster4 <- cleaned_clinical_data[which(PCdata$cluster == 4),]
+
+# Find counts for each of these
+c1_1 <- c("Cluster 1", "Stage 1", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c1_2 <- c("Cluster 1", "Stage 2", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c1_3 <- c("Cluster 1", "Stage 3", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c1_4 <- c("Cluster 1", "Stage 4", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c2_1 <- c("Cluster 2", "Stage 1", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c2_2 <- c("Cluster 2", "Stage 2", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c2_3 <- c("Cluster 2", "Stage 3", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c2_4 <- c("Cluster 2", "Stage 4", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c3_1 <- c("Cluster 3", "Stage 1", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c3_2 <- c("Cluster 3", "Stage 2", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c3_3 <- c("Cluster 3", "Stage 3", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c3_4 <- c("Cluster 3", "Stage 4", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c4_1 <- c("Cluster 4", "Stage 1", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c4_2 <- c("Cluster 4", "Stage 2", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c4_3 <- c("Cluster 4", "Stage 3", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c4_4 <- c("Cluster 4", "Stage 4", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+# Collect into dataframe
+cluster_summary <- as.data.frame(t(data.frame(c1_1, c1_2, c1_3, c1_4, c2_1, c2_2, c2_3, c2_4, c3_1, c3_2, c3_3, c3_4, c4_1, c4_2, c4_3, c4_4)))
+colnames(cluster_summary) <- c('Cluster','Stage','Counts')
+# Confirm it's numeric (we ran into issues with this due to transposing, etc...)
+cluster_summary$Counts <- as.numeric(cluster_summary$Counts)
+cluster_df <- as.data.frame(cluster_summary)
+
+# Plot counts per stage
+ggplot() + geom_col(data = cluster_df, aes(x= Cluster, y = Counts, fill = Stage),stat='summary', position='dodge') + ggtitle('Count of Cancer Stage in Clusters')
+```
+As we can see, it does not match up with cancer stages at all (all stages are represented in each cluster. This is likely because using values from just two PCs (which we selected to be able to visualize it) does not represent the full variance. It's almost certain that more dimensions would be required to separate the data into groups. 
+
+Given that the counts for patients may each have different sequencing depth, running PCA likely won't allow for us to have clusters accurate to the original data. We realized this after performing the above analysis. The rest of the analysis will be using the log(TPM + 1) data as PCA will not work.
+
+# K-means Clustering k = 4
+Cluster the original data, and once again assume we'll have 4 groups of separation. 
+```{r}
+# Cluster, store values
+# Use log_TPM_plusone so that genes with a higher baseline expression don't have as much of a higher weighting in distance between points
+# Hard code the columns used as we will add a cluster label later
+kmeans_pc <- kmeans(Tlog_TPM_plusone[,1:24769], centers = 4, nstart = 10)
+kmeans_pc_summary <- data.frame(kmeans_pc$size, kmeans_pc$centers)
+Tlog_TPM_plusone$cluster1 <- as.character(kmeans_pc$cluster)
+```
+
+```{r}
+# See summary
+kmeans_pc_summary
+```
+
+```{r}
+# How many values per cluster?
+ggplot(data = Tlog_TPM_plusone, aes(cluster1)) + geom_bar(aes(fill=cluster1)) + ggtitle('Count of samples per cluster')
+```
+Note that once again, this doesn't match with our count of cancer stage above - our clusters likely won't match to the cancer stages unfortunately. But, let's see counts of cancer stage per cluster to confirm this.
+
+## Counts - Cancer Stage
+```{r}
+# Subset each cluster from the clinical data
+cluster1 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 1),]
+cluster2 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 2),]
+cluster3 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 3),]
+cluster4 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 4),]
+
+# Find counts for each stage of cancer in each cluster
+c1_1 <- c("Cluster 1", "Stage 1", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c1_2 <- c("Cluster 1", "Stage 2", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c1_3 <- c("Cluster 1", "Stage 3", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c1_4 <- c("Cluster 1", "Stage 4", length(which(cluster1$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c2_1 <- c("Cluster 2", "Stage 1", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c2_2 <- c("Cluster 2", "Stage 2", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c2_3 <- c("Cluster 2", "Stage 3", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c2_4 <- c("Cluster 2", "Stage 4", length(which(cluster2$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c3_1 <- c("Cluster 3", "Stage 1", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c3_2 <- c("Cluster 3", "Stage 2", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c3_3 <- c("Cluster 3", "Stage 3", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c3_4 <- c("Cluster 3", "Stage 4", length(which(cluster3$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+c4_1 <- c("Cluster 4", "Stage 1", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 1)))
+c4_2 <- c("Cluster 4", "Stage 2", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 2)))
+c4_3 <- c("Cluster 4", "Stage 3", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 3)))
+c4_4 <- c("Cluster 4", "Stage 4", length(which(cluster4$AJCC_PATHOLOGIC_TUMOR_STAGE == 4)))
+
+# Collect into dataframe
+cluster_summary <- as.data.frame(t(data.frame(c1_1, c1_2, c1_3, c1_4, c2_1, c2_2, c2_3, c2_4, c3_1, c3_2, c3_3, c3_4, c4_1, c4_2, c4_3, c4_4)))
+colnames(cluster_summary) <- c('Cluster','Stage','Counts')
+cluster_summary$Counts <- as.numeric(cluster_summary$Counts)
+cluster_df <- as.data.frame(cluster_summary)
+
+# Plot counts per stage
+ggplot() + geom_col(data = cluster_df, aes(x= Cluster, y = Counts, fill = Stage),stat='summary', position='dodge') + ggtitle('Count of Cancer Stage in Clusters')
+
+```
+While these results are different than before, there's no clear mapping of these clusters to our different stages of cancer. So, we can't use these clusters to narrow down what genes may be causing different stages of cancer.
+
+Let's re-do the same process and see if we can cluster and find concordance with any other parameters (specifically sex and race).
+
+## Counts - Race
+Next, let's see if we can find any differences in expression for Race:
+
+Note that clustering is already done - we want to assume there are 4 clusters once again.
+```{r}
+# How many values per cluster?
+ggplot(data = Tlog_TPM_plusone, aes(cluster1)) + geom_bar(aes(fill=cluster1)) + ggtitle('Count of samples per cluster')
+```
+
+```{r}
+# Subset each cluster from the clinical data
+cluster1 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 1),]
+cluster2 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 2),]
+cluster3 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 3),]
+cluster4 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster1 == 4),]
+
+# Find counts for each of these
+c1_1 <- c("Cluster 1", "Asian", length(which(cluster1$RACE == "Asian")))
+c1_2 <- c("Cluster 1", "White", length(which(cluster1$RACE == "White")))
+c1_3 <- c("Cluster 1", "Black or African American", length(which(cluster1$RACE == "Black or African American")))
+c1_4 <- c("Cluster 1", "Other/Blank", length(which(cluster1$RACE == "")))
+
+c2_1 <- c("Cluster 2", "Asian", length(which(cluster2$RACE == "Asian")))
+c2_2 <- c("Cluster 2", "White", length(which(cluster2$RACE == "White")))
+c2_3 <- c("Cluster 2", "Black or African American", length(which(cluster2$RACE == "Black or African American")))
+c2_4 <- c("Cluster 2", "Other/Blank", length(which(cluster2$RACE == "")))
+
+c3_1 <- c("Cluster 3", "Asian", length(which(cluster3$RACE == "Asian")))
+c3_2 <- c("Cluster 3", "White", length(which(cluster3$RACE == "White")))
+c3_3 <- c("Cluster 3", "Black or African American", length(which(cluster3$RACE == "Black or African American")))
+c3_4 <- c("Cluster 3", "Other/Blank", length(which(cluster3$RACE == "")))
+
+c4_1 <- c("Cluster 4", "Asian", length(which(cluster4$RACE == "Asian")))
+c4_2 <- c("Cluster 4", "White", length(which(cluster4$RACE == "White")))
+c4_3 <- c("Cluster 4", "Black or African American", length(which(cluster4$RACE == "Black or African American")))
+c4_4 <- c("Cluster 4", "Other/Blank", length(which(cluster4$RACE == "")))
+
+# Collect into dataframe
+cluster_summary <- as.data.frame(t(data.frame(c1_1, c1_2, c1_3, c1_4, c2_1, c2_2, c2_3, c2_4, c3_1, c3_2, c3_3, c3_4, c4_1, c4_2, c4_3, c4_4)))
+colnames(cluster_summary) <- c('Cluster','Race','Counts')
+cluster_summary$Counts <- as.numeric(cluster_summary$Counts)
+cluster_df <- as.data.frame(cluster_summary)
+
+# Plot counts per stage
+ggplot() + geom_col(data = cluster_df, aes(x= Cluster, y = Counts, fill = Race),stat='summary', position='dodge') + ggtitle('Count of Race in Clusters')
+```
+
+# K-means clustering k = 2
+
+First, let's see if we can find any differences in expression for sex (two choices, cluster k = 2):
+```{r}
+# Cluster, store values
+kmeans <- kmeans(Tlog_TPM_plusone[,1:24769], centers = 2, nstart = 10)
+kmeans_summary <- data.frame(kmeans$size, kmeans$centers)
+Tlog_TPM_plusone$cluster2 <- as.character(kmeans$cluster)
+
+kmeans_summary
+```
+
+```{r}
+# How many values per cluster?
+ggplot(data = Tlog_TPM_plusone, aes(cluster2)) + geom_bar(aes(fill=cluster2)) + ggtitle('Count of samples per cluster')
+```
+## Counts - Sex
+```{r}
+# Subset each cluster from the clinical data
+cluster1 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster2 == 1),]
+cluster2 <- cleaned_clinical_data[which(Tlog_TPM_plusone$cluster2 == 2),]
+
+# Find counts for each of these
+c1_1 <- c("Cluster 1", "Female", length(which(cluster1$SEX == 0)))
+c1_2 <- c("Cluster 1", "Male", length(which(cluster1$SEX == 1)))
+
+c2_1 <- c("Cluster 2", "Female", length(which(cluster2$SEX == 0)))
+c2_2 <- c("Cluster 2", "Male", length(which(cluster2$SEX == 1)))
+
+# Collect into dataframe
+cluster_summary <- as.data.frame(t(data.frame(c1_1, c1_2, c2_1, c2_2)))
+colnames(cluster_summary) <- c('Cluster','Sex','Counts')
+cluster_summary$Counts <- as.numeric(cluster_summary$Counts)
+cluster_df <- as.data.frame(cluster_summary)
+
+# Plot counts per stage
+ggplot(data = cluster_df, aes(x= Cluster, y = Counts, fill = Sex),stat='summary') + geom_col(position='dodge') + ggtitle('Count of Sex in Clusters')
+```
+
+
+# Survival Analysis
+Let's run survival analysis on each of our clusters:
+```{r}
+#First, collect data
+table(clinical_data$OS_STATUS)
+
+clin_df = cleaned_clinical_data[,
+                    c("PATIENT_ID",
+                      "DSS_STATUS",
+                      "DSS_MONTHS",
+                      "DAYS_LAST_FOLLOWUP",
+                      "SEX",
+                      "AJCC_PATHOLOGIC_TUMOR_STAGE",
+                      "RACE",
+                      "AGE")]
+# Add column with life status
+clin_df$deceased = clin_df$DSS_STATUS == "1:DEAD WITH TUMOR"
+
+# Add column with cancer stage field
+clin_df$AJCC_stage = clin_df$AJCC_PATHOLOGIC_TUMOR_STAGE
+
+# create an "overall survival" variable that is equal to days_to_death
+# for dead patients, and to days_to_last_follow_up for patients who
+# are still alive
+clin_df$overall_survival = cleaned_clinical_data$OS_MONTHS*30 #30 days = month
+
+# Add column with RACE field
+clin_df$race = ifelse(clin_df$RACE == "White" | clin_df$RACE == "Asian" | clin_df$RACE == "Black or African American", clin_df$RACE, "Other")
+
+# Add column with SEX field
+clin_df$SEX = ifelse(clin_df$SEX == 0, "Female", "Male")
+
+# Add column with AGE range field
+clin_df$age <- sapply(clin_df$AGE, function(x) {switch(ifelse(x < 60, 0, 1) + ifelse(x < 70, 0, 1) + ifelse(x < 80, 0, 1) + 1, "<60", "60-70", "70-80", "80+")})
+
+# Add cluster assignments for k = 2 and k = 4 clustering
+clin_df$cluster1 <- Tlog_TPM_plusone$cluster1
+clin_df$cluster2 <- Tlog_TPM_plusone$cluster2
+
+# show first 10 samples
+head(clin_df)
+```
+The following show overall survival rates for:
+
+## Sex
+```{r}
+# Survival Curve
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = clin_df)
+# Survival Table
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Cancer Stage
+```{r}
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = clin_df)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+```
+
+## Race
+```{r}
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = clin_df)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Age
+```{r}
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = clin_df)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+Now, let's perform survival analysis for each of our k-means clustering runs to see if we find anything different:
+
+# Survival Analysis on Clusters k = 4
+## Cluster 1
+```{r}
+# Identify all values in cluster 1
+cluster1 <- clin_df[which(Tlog_TPM_plusone$cluster1 == 1),]
+# Survival analysis (same as above):
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster1)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster1)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster1)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster1)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Cluster 2
+```{r}
+# Identify all values in cluster 2
+cluster2 <- clin_df[which(Tlog_TPM_plusone$cluster1 == 2),]
+# Survival analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster2)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster2)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster2)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster2)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Cluster 3
+```{r}
+# Identify all values in cluster 3
+cluster3 <- clin_df[which(Tlog_TPM_plusone$cluster1 == 3),]
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster3)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster3)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster3)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster3)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Cluster 4
+```{r}
+# Identify all values in cluster 4
+cluster4 <- clin_df[which(Tlog_TPM_plusone$cluster1 == 4),]
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster4)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster4)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster4)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster4)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## All clusters
+```{r}
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ cluster1, data = clin_df)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+
+# Survival Analysis on Clusters k = 2:
+
+## Cluster 1
+```{r}
+# Identify all values in cluster 1
+cluster2_1 <- clin_df[which(Tlog_TPM_plusone$cluster2 == 1),]
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster2_1)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster2_1)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster2_1)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster2_1)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## Cluster 2
+```{r}
+# Identify all values in cluster 2
+cluster2_2 <- clin_df[which(Tlog_TPM_plusone$cluster2 == 2),]
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ SEX, data = cluster2_2)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ AJCC_stage, data = cluster2_2)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.45)
+
+fit = survfit(Surv(overall_survival, deceased) ~ race, data = cluster2_2)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+
+fit = survfit(Surv(overall_survival, deceased) ~ age, data = cluster2_2)
+ggsurvplot(fit, data=clin_df, pval=T,risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
+
+## All clusters
+```{r}
+# Survival Analysis:
+fit = survfit(Surv(overall_survival, deceased) ~ cluster2, data = clin_df)
+ggsurvplot(fit, data=clin_df, pval=T, risk.table=T, risk.table.col="strata", risk.table.height=0.35)
+```
